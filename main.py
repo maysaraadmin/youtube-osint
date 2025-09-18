@@ -20,14 +20,14 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 
 # ---------- 3rd-party deps ---------------------------------------------------
 try:
-    from googleapiclient.discovery import build
-except ImportError:
-    print("pip install google-api-python-client")
-    sys.exit(1)
-try:
     import yt_dlp as ytdlp
 except ImportError:
     print("pip install yt-dlp")
+    sys.exit(1)
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("pip install beautifulsoup4")
     sys.exit(1)
 
 # ---------- GLOBALS ----------------------------------------------------------
@@ -38,14 +38,13 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # ---------- WORKER THREADS ----------------------------------------------------
 class YouTubeSearchThread(QThread):
-    """Generic worker that talks to YouTube Data API v3."""
+    """Generic worker that uses yt-dlp and web scraping for YouTube search."""
     result_ready = pyqtSignal(dict)
     error = pyqtSignal(str)
     log = pyqtSignal(str)
 
-    def __init__(self, api_key, query, search_type="video", max_results=50):
+    def __init__(self, query, search_type="video", max_results=50):
         super().__init__()
-        self.api_key = api_key
         self.query = query
         self.search_type = search_type
         self.max_results = max_results
@@ -53,95 +52,219 @@ class YouTubeSearchThread(QThread):
 
     def run(self):
         try:
-            youtube = build("youtube", "v3", developerKey=self.api_key,
-                            cache_discovery=False)
             self.log.emit(f"Searching YouTube ({self.search_type}s) for: {self.query}")
-            req = youtube.search().list(q=self.query,
-                                        part="snippet",
-                                        type=self.search_type,
-                                        order="relevance",
-                                        maxResults=self.max_results)
-            res = req.execute()
-            items = res.get("items", [])
+            
+            # Use yt-dlp to extract information
+            ydl_opts = {
+                'quiet': True,
+                'extract_flat': True,
+                'playlistend': self.max_results,
+                'default_search': 'ytsearch' + str(self.max_results),
+            }
+            
+            with ytdlp.YoutubeDL(ydl_opts) as ydl:
+                search_results = ydl.extract_info(f"ytsearch{self.max_results}:{self.query}", download=False)
+            
+            items = []
+            if 'entries' in search_results:
+                for entry in search_results['entries'][:self.max_results]:
+                    if self._abort:
+                        break
+                    
+                    # Convert yt-dlp format to API-like format
+                    item = {
+                        'id': {
+                            'videoId': entry.get('id', '') if self.search_type == 'video' else '',
+                            'channelId': entry.get('channel_id', '')
+                        },
+                        'snippet': {
+                            'title': entry.get('title', ''),
+                            'description': entry.get('description', ''),
+                            'channelTitle': entry.get('channel', ''),
+                            'publishedAt': entry.get('upload_date', ''),
+                            'thumbnails': {
+                                'default': {'url': entry.get('thumbnail', '')},
+                                'medium': {'url': entry.get('thumbnail', '')},
+                                'high': {'url': entry.get('thumbnail', '')}
+                            }
+                        }
+                    }
+                    items.append(item)
+            
             self.log.emit(f"Found {len(items)} {self.search_type}(s)")
             self.result_ready.emit({"type": self.search_type, "items": items})
         except Exception as e:
             self.error.emit(str(e))
+    
+    def abort(self):
+        self._abort = True
 
 class ChannelDetailsThread(QThread):
-    """Fetch full channel statistics + uploads playlist."""
+    """Fetch full channel statistics + uploads playlist using yt-dlp."""
     result_ready = pyqtSignal(dict)
     error = pyqtSignal(str)
     log = pyqtSignal(str)
 
-    def __init__(self, api_key, channel_id):
+    def __init__(self, channel_url_or_id):
         super().__init__()
-        self.api_key = api_key
-        self.channel_id = channel_id
+        self.channel_url_or_id = channel_url_or_id
+        self._abort = False
 
     def run(self):
         try:
-            youtube = build("youtube", "v3", developerKey=self.api_key,
-                            cache_discovery=False)
-            self.log.emit(f"Fetching channel details for {self.channel_id}")
-            req = youtube.channels().list(part="snippet,statistics,contentDetails",
-                                         id=self.channel_id)
-            res = req.execute()
-            if not res["items"]:
+            self.log.emit(f"Fetching channel details for {self.channel_url_or_id}")
+            
+            # Handle both URLs and channel IDs
+            if self.channel_url_or_id.startswith(('http://', 'https://')):
+                channel_url = self.channel_url_or_id
+            else:
+                # Convert channel ID to URL
+                channel_url = f"https://www.youtube.com/channel/{self.channel_url_or_id}"
+            
+            # Use yt-dlp to extract channel information
+            ydl_opts = {
+                'quiet': True,
+                'extract_flat': True,
+                'playlistend': 1,
+            }
+            
+            with ytdlp.YoutubeDL(ydl_opts) as ydl:
+                try:
+                    info = ydl.extract_info(channel_url, download=False)
+                except Exception as e:
+                    # Try alternative URL format
+                    if not self.channel_url_or_id.startswith(('http://', 'https://')):
+                        channel_url = f"https://www.youtube.com/c/{self.channel_url_or_id}"
+                        info = ydl.extract_info(channel_url, download=False)
+                    else:
+                        raise
+            
+            if not info:
                 self.error.emit("Channel not found")
                 return
-            chan = res["items"][0]
-            self.result_ready.emit(chan)
+            
+            # Convert yt-dlp format to API-like format
+            channel_data = {
+                'id': info.get('channel_id', ''),
+                'snippet': {
+                    'title': info.get('channel', ''),
+                    'description': info.get('description', ''),
+                    'publishedAt': info.get('upload_date', ''),
+                    'thumbnails': {
+                        'default': {'url': info.get('thumbnail', '')},
+                        'medium': {'url': info.get('thumbnail', '')},
+                        'high': {'url': info.get('thumbnail', '')}
+                    }
+                },
+                'statistics': {
+                    'subscriberCount': info.get('channel_follower_count', 0),
+                    'videoCount': info.get('n_entries', 0),
+                    'viewCount': info.get('view_count', 0)
+                },
+                'contentDetails': {
+                    'relatedPlaylists': {
+                        'uploads': info.get('channel_id', '')
+                    }
+                }
+            }
+            
+            self.result_ready.emit(channel_data)
         except Exception as e:
             self.error.emit(str(e))
+    
+    def abort(self):
+        self._abort = True
 
 class VideoDetailsThread(QThread):
-    """Deep-dive on a single video (+ comments)."""
+    """Deep-dive on a single video (+ comments) using yt-dlp."""
     result_ready = pyqtSignal(dict)
     error = pyqtSignal(str)
     log = pyqtSignal(str)
 
-    def __init__(self, api_key, video_id):
+    def __init__(self, video_url_or_id):
         super().__init__()
-        self.api_key = api_key
-        self.video_id = video_id
+        self.video_url_or_id = video_url_or_id
+        self._abort = False
 
     def run(self):
         try:
-            youtube = build("youtube", "v3", developerKey=self.api_key,
-                            cache_discovery=False)
-            self.log.emit(f"Fetching video details for {self.video_id}")
-            req = youtube.videos().list(part="snippet,statistics,contentDetails,topicDetails",
-                                       id=self.video_id)
-            res = req.execute()
-            if not res["items"]:
+            self.log.emit(f"Fetching video details for {self.video_url_or_id}")
+            
+            # Handle both URLs and video IDs
+            if self.video_url_or_id.startswith(('http://', 'https://')):
+                video_url = self.video_url_or_id
+            else:
+                # Convert video ID to URL
+                video_url = f"https://www.youtube.com/watch?v={self.video_url_or_id}"
+            
+            # Use yt-dlp to extract video information
+            ydl_opts = {
+                'quiet': True,
+                'writeinfojson': False,
+                'writesubtitles': False,
+                'getcomments': True,
+                'extract_flat': False,
+            }
+            
+            with ytdlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+            
+            if not info:
                 self.error.emit("Video not found")
                 return
-            vid = res["items"][0]
-
-            # comments
+            
+            # Convert yt-dlp format to API-like format
+            video_data = {
+                'id': info.get('id', ''),
+                'snippet': {
+                    'title': info.get('title', ''),
+                    'description': info.get('description', ''),
+                    'channelTitle': info.get('channel', ''),
+                    'channelId': info.get('channel_id', ''),
+                    'publishedAt': info.get('upload_date', ''),
+                    'thumbnails': {
+                        'default': {'url': info.get('thumbnail', '')},
+                        'medium': {'url': info.get('thumbnail', '')},
+                        'high': {'url': info.get('thumbnail', '')}
+                    }
+                },
+                'statistics': {
+                    'viewCount': info.get('view_count', 0),
+                    'likeCount': info.get('like_count', 0),
+                    'dislikeCount': 0,  # YouTube removed dislikes
+                    'favoriteCount': 0,
+                    'commentCount': info.get('comment_count', 0)
+                },
+                'contentDetails': {
+                    'duration': info.get('duration', 0),
+                    'dimension': '2d',
+                    'definition': 'hd' if info.get('height', 0) >= 720 else 'sd',
+                    'caption': 'false',
+                    'licensedContent': False
+                }
+            }
+            
+            # Extract comments if available
             comments = []
-            try:
-                c_req = youtube.commentThreads().list(part="snippet,replies",
-                                                     videoId=self.video_id,
-                                                     maxResults=100,
-                                                     order="time")
-                c_res = c_req.execute()
-                for top in c_res["items"]:
-                    snippet = top["snippet"]["topLevelComment"]["snippet"]
-                    comments.append({
-                        "author": snippet["authorDisplayName"],
-                        "text": snippet["textDisplay"],
-                        "likes": snippet["likeCount"],
-                        "published": snippet["publishedAt"]
-                    })
-            except Exception as e:
+            if 'comments' in info:
+                for comment in info['comments'][:100]:  # Limit to 100 comments
+                    if 'text' in comment:
+                        comments.append({
+                            "author": comment.get('author', ''),
+                            "text": comment.get('text', ''),
+                            "likes": comment.get('like_count', 0),
+                            "published": comment.get('timestamp', '')
+                        })
+            else:
                 self.log.emit("Comments disabled or restricted")
-
-            vid["comments"] = comments
-            self.result_ready.emit(vid)
+            
+            video_data["comments"] = comments
+            self.result_ready.emit(video_data)
         except Exception as e:
             self.error.emit(str(e))
+    
+    def abort(self):
+        self._abort = True
 
 class ProfileImageDownloadThread(QThread):
     """Download high-quality profile images from YouTube channels."""
@@ -564,29 +687,26 @@ class DocumentIntelligenceThread(QThread):
 
 
 class VideoAnalysisThread(QThread):
-    """Worker thread for Enhanced Video Analysis with engagement metrics and performance analytics."""
+    """Worker thread for Enhanced Video Analysis with engagement metrics and performance analytics using yt-dlp."""
     log = pyqtSignal(str)
     error = pyqtSignal(str)
     result_ready = pyqtSignal(dict)
     progress = pyqtSignal(int)
 
-    def __init__(self, api_key, video_ids):
+    def __init__(self, video_urls_or_ids):
         super().__init__()
-        self.api_key = api_key
-        self.video_ids = video_ids
+        self.video_urls_or_ids = video_urls_or_ids
         self._abort = False
 
     def run(self):
         """Run enhanced video analysis."""
         try:
-            self.log.emit(f"Starting enhanced analysis for {len(self.video_ids)} videos...")
-            
-            youtube = build("youtube", "v3", developerKey=self.api_key, cache_discovery=False)
+            self.log.emit(f"Starting enhanced analysis for {len(self.video_urls_or_ids)} videos...")
             
             results = {
                 "videos": [],
                 "summary": {
-                    "total_videos": len(self.video_ids),
+                    "total_videos": len(self.video_urls_or_ids),
                     "total_views": 0,
                     "total_likes": 0,
                     "total_comments": 0,
@@ -600,15 +720,21 @@ class VideoAnalysisThread(QThread):
                 }
             }
             
-            for i, video_id in enumerate(self.video_ids):
+            for i, video_url_or_id in enumerate(self.video_urls_or_ids):
                 if self._abort:
                     return
                     
-                self.progress.emit(int((i + 1) / len(self.video_ids) * 100))
-                self.log.emit(f"Analyzing video {i + 1}/{len(self.video_ids)}: {video_id}")
+                self.progress.emit(int((i + 1) / len(self.video_urls_or_ids) * 100))
+                self.log.emit(f"Analyzing video {i + 1}/{len(self.video_urls_or_ids)}: {video_url_or_id}")
+                
+                # Handle both URLs and video IDs
+                if video_url_or_id.startswith(('http://', 'https://')):
+                    video_url = video_url_or_id
+                else:
+                    video_url = f"https://www.youtube.com/watch?v={video_url_or_id}"
                 
                 # Get video details and statistics
-                video_data = self.get_video_details(youtube, video_id)
+                video_data = self.get_video_details(video_url)
                 if video_data:
                     # Calculate engagement metrics
                     engagement_metrics = self.calculate_engagement_metrics(video_data)
@@ -634,44 +760,48 @@ class VideoAnalysisThread(QThread):
         except Exception as e:
             self.error.emit(f"Enhanced video analysis failed: {str(e)}")
     
-    def get_video_details(self, youtube, video_id):
-        """Get detailed video information including statistics."""
+    def get_video_details(self, video_url):
+        """Get detailed video information including statistics using yt-dlp."""
         try:
-            # Get video details
-            video_request = youtube.videos().list(
-                part="snippet,statistics,contentDetails,status,topicDetails",
-                id=video_id
-            )
-            video_response = video_request.execute()
+            # Use yt-dlp to extract video information
+            ydl_opts = {
+                'quiet': True,
+                'writeinfojson': False,
+                'writesubtitles': False,
+                'getcomments': False,
+                'extract_flat': False,
+            }
             
-            if not video_response["items"]:
+            with ytdlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+            
+            if not info:
                 return None
             
-            video_info = video_response["items"][0]
-            snippet = video_info.get("snippet", {})
-            statistics = video_info.get("statistics", {})
-            content_details = video_info.get("contentDetails", {})
-            
             return {
-                "video_id": video_id,
-                "title": snippet.get("title", ""),
-                "description": snippet.get("description", ""),
-                "channel_title": snippet.get("channelTitle", ""),
-                "published_at": snippet.get("publishedAt", ""),
-                "thumbnails": snippet.get("thumbnails", {}),
-                "tags": snippet.get("tags", []),
-                "category_id": snippet.get("categoryId", ""),
-                "live_broadcast_content": snippet.get("liveBroadcastContent", ""),
-                "default_language": snippet.get("defaultLanguage", ""),
-                "view_count": int(statistics.get("viewCount", 0)),
-                "like_count": int(statistics.get("likeCount", 0)),
-                "comment_count": int(statistics.get("commentCount", 0)),
-                "favorite_count": int(statistics.get("favoriteCount", 0)),
-                "duration": content_details.get("duration", ""),
-                "dimension": content_details.get("dimension", ""),
-                "definition": content_details.get("definition", ""),
-                "caption": content_details.get("caption", "false"),
-                "licensed_content": content_details.get("licensedContent", False)
+                "video_id": info.get('id', ''),
+                "title": info.get('title', ''),
+                "description": info.get('description', ''),
+                "channel_title": info.get('channel', ''),
+                "published_at": info.get('upload_date', ''),
+                "thumbnails": {
+                    'default': {'url': info.get('thumbnail', '')},
+                    'medium': {'url': info.get('thumbnail', '')},
+                    'high': {'url': info.get('thumbnail', '')}
+                },
+                "tags": info.get('tags', []),
+                "category_id": info.get('category', ''),
+                "live_broadcast_content": "none" if not info.get('is_live', False) else "live",
+                "default_language": info.get('language', ''),
+                "view_count": info.get('view_count', 0),
+                "like_count": info.get('like_count', 0),
+                "comment_count": info.get('comment_count', 0),
+                "favorite_count": 0,
+                "duration": info.get('duration', 0),
+                "dimension": "2d",
+                "definition": "hd" if info.get('height', 0) >= 720 else "sd",
+                "caption": "true" if info.get('subtitles') else "false",
+                "licensed_content": False
             }
             
         except Exception as e:
@@ -899,66 +1029,170 @@ class VideoAnalysisThread(QThread):
                              reverse=True)
         results["summary"]["top_performing_videos"] = sorted_videos[:5]  # Top 5
     
-    def abort(self):
-        self._abort = True
+
+def calculate_content_effectiveness(self, video_data):
+    """Calculate content effectiveness based on various factors."""
+    description_length = len(video_data.get("description", ""))
+    tag_count = len(video_data.get("tags", []))
+    has_caption = video_data.get("caption") == "true"
+    
+    # Score based on content optimization
+    description_score = min(100, description_length / 10)  # 1 point per 10 characters
+    tag_score = min(100, tag_count * 10)  # 10 points per tag
+    caption_score = 20 if has_caption else 0
+    
+    content_effectiveness = (description_score * 0.4) + (tag_score * 0.4) + (caption_score * 0.2)
+    return content_effectiveness
+
+def simulate_audience_retention(self, video_data):
+    """Simulate audience retention based on video characteristics."""
+    duration = video_data.get("duration", "")
+    like_count = video_data.get("like_count", 0)
+    view_count = video_data.get("view_count", 0)
+    
+    # Base retention from engagement
+    if view_count > 0:
+        engagement_ratio = like_count / view_count
+    else:
+        engagement_ratio = 0
+    
+    # Duration factor (shorter videos generally have higher retention)
+    try:
+        duration_seconds = self.parse_duration(duration)
+        duration_factor = max(0.3, 1 - (duration_seconds / 3600))  # Decreases for longer videos
+    except:
+        duration_factor = 0.7
+    
+    # Simulated retention rate
+    retention_rate = (engagement_ratio * 100) * duration_factor
+    return min(95, max(5, retention_rate))
+
+def parse_duration(self, duration_str):
+    """Parse ISO 8601 duration string to seconds."""
+    import re
+    pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+    match = re.match(pattern, duration_str)
+    if match:
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        seconds = int(match.group(3) or 0)
+        return hours * 3600 + minutes * 60 + seconds
+    return 0
+
+def calculate_growth_potential(self, video_data):
+    """Calculate growth potential based on current performance and trends."""
+    engagement_score = video_data.get("engagement_metrics", {}).get("engagement_score", 0)
+    virality_score = video_data.get("engagement_metrics", {}).get("virality_score", 0)
+    performance_score = video_data.get("performance_analytics", {}).get("performance_score", 0)
+    
+    # Growth potential based on multiple factors
+    growth_potential = (engagement_score * 0.4) + (virality_score * 0.3) + (performance_score * 0.3)
+    return growth_potential
+
+def get_performance_category(self, performance_score):
+    """Get performance category based on score."""
+    if performance_score >= 80:
+        return "Excellent"
+    elif performance_score >= 60:
+        return "Good"
+    elif performance_score >= 40:
+        return "Average"
+    else:
+        return "Below Average"
+
+def update_summary_statistics(self, results, video_data):
+    """Update summary statistics with video data."""
+    view_count = video_data.get("view_count", 0)
+    like_count = video_data.get("like_count", 0)
+    comment_count = video_data.get("comment_count", 0)
+    engagement_level = video_data.get("engagement_metrics", {}).get("engagement_level", "low")
+    
+    results["summary"]["total_views"] += view_count
+    results["summary"]["total_likes"] += like_count
+    results["summary"]["total_comments"] += comment_count
+    results["summary"]["engagement_distribution"][engagement_level] += 1
+
+def calculate_final_summary(self, results):
+    """Calculate final summary metrics."""
+    total_views = results["summary"]["total_views"]
+    total_likes = results["summary"]["total_likes"]
+    total_comments = results["summary"]["total_comments"]
+    total_videos = results["summary"]["total_videos"]
+    
+    if total_views > 0:
+        avg_engagement_rate = ((total_likes + total_comments) / total_views) * 100
+    else:
+        avg_engagement_rate = 0
+    
+    results["summary"]["average_engagement_rate"] = round(avg_engagement_rate, 2)
+    
+    # Find top performing videos
+    sorted_videos = sorted(results["videos"], 
+                         key=lambda x: x.get("performance_analytics", {}).get("performance_score", 0), 
+                         reverse=True)
+    results["summary"]["top_performing_videos"] = sorted_videos[:5]  # Top 5
+
+def abort(self):
+    self._abort = True
 
 
 class RelatedVideosThread(QThread):
-    """Worker thread for extracting related videos and content recommendations."""
+    """Worker thread for extracting related videos and content recommendations using yt-dlp."""
     log = pyqtSignal(str)
     error = pyqtSignal(str)
     result_ready = pyqtSignal(dict)
     progress = pyqtSignal(int)
 
-    def __init__(self, api_key, video_ids, max_related=20):
+    def __init__(self, video_urls_or_ids, max_related=20):
         super().__init__()
-        self.api_key = api_key
-        self.video_ids = video_ids
+        self.video_urls_or_ids = video_urls_or_ids
         self.max_related = max_related
         self._abort = False
 
     def run(self):
         """Extract related videos and content recommendations."""
         try:
-            self.log.emit(f"Starting related videos extraction for {len(self.video_ids)} videos...")
-            
-            youtube = build("youtube", "v3", developerKey=self.api_key, cache_discovery=False)
+            self.log.emit(f"Starting related videos extraction for {len(self.video_urls_or_ids)} videos...")
             
             results = {
                 "source_videos": [],
                 "related_videos": [],
-                "content_recommendations": [],
+                "recommendations": [],
                 "summary": {
-                    "total_source_videos": len(self.video_ids),
+                    "total_source_videos": len(self.video_urls_or_ids),
                     "total_related_videos": 0,
-                    "unique_channels": set(),
-                    "content_categories": {},
-                    "recommendation_patterns": {}
+                    "total_recommendations": 0,
+                    "average_related_per_video": 0,
+                    "top_recommendations": []
                 }
             }
             
-            for i, video_id in enumerate(self.video_ids):
+            for i, video_url_or_id in enumerate(self.video_urls_or_ids):
                 if self._abort:
                     return
                     
-                self.progress.emit(int((i + 1) / len(self.video_ids) * 100))
-                self.log.emit(f"Processing video {i + 1}/{len(self.video_ids)}: {video_id}")
+                self.progress.emit(int((i + 1) / len(self.video_urls_or_ids) * 100))
+                self.log.emit(f"Processing video {i + 1}/{len(self.video_urls_or_ids)}: {video_url_or_id}")
+                
+                # Handle both URLs and video IDs
+                if video_url_or_id.startswith(('http://', 'https://')):
+                    video_url = video_url_or_id
+                else:
+                    video_url = f"https://www.youtube.com/watch?v={video_url_or_id}"
                 
                 # Get source video details
-                source_video = self.get_video_details(youtube, video_id)
+                source_video = self.get_video_details(video_url)
                 if source_video:
                     results["source_videos"].append(source_video)
                     
-                    # Extract related videos
-                    related_videos = self.get_related_videos(youtube, video_id)
-                    results["related_videos"].extend(related_videos)
-                    
-                    # Generate content recommendations
-                    recommendations = self.generate_content_recommendations(source_video, related_videos)
-                    results["content_recommendations"].extend(recommendations)
-                    
-                    # Update summary statistics
-                    self.update_related_summary(results, related_videos)
+                    # Get related videos
+                    related_videos = self.get_related_videos(video_url)
+                    if related_videos:
+                        results["related_videos"].extend(related_videos)
+                        
+                        # Generate content recommendations
+                        recommendations = self.generate_content_recommendations(source_video, related_videos)
+                        results["recommendations"].extend(recommendations)
                 
                 time.sleep(0.5)  # Rate limiting
             
@@ -974,97 +1208,137 @@ class RelatedVideosThread(QThread):
         except Exception as e:
             self.error.emit(f"Related videos extraction failed: {str(e)}")
     
-    def get_video_details(self, youtube, video_id):
-        """Get basic video details for source video."""
+    def get_video_details(self, video_url):
+        """Get basic video details for source video using yt-dlp."""
         try:
-            video_request = youtube.videos().list(
-                part="snippet,statistics",
-                id=video_id
-            )
-            video_response = video_request.execute()
+            # Use yt-dlp to extract video information
+            ydl_opts = {
+                'quiet': True,
+                'writeinfojson': False,
+                'writesubtitles': False,
+                'getcomments': False,
+                'extract_flat': False,
+            }
             
-            if not video_response["items"]:
+            with ytdlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+            
+            if not info:
                 return None
             
-            video_info = video_response["items"][0]
-            snippet = video_info.get("snippet", {})
-            statistics = video_info.get("statistics", {})
-            
             return {
-                "video_id": video_id,
-                "title": snippet.get("title", ""),
-                "channel_title": snippet.get("channelTitle", ""),
-                "channel_id": snippet.get("channelId", ""),
-                "description": snippet.get("description", ""),
-                "published_at": snippet.get("publishedAt", ""),
-                "view_count": int(statistics.get("viewCount", 0)),
-                "like_count": int(statistics.get("likeCount", 0)),
-                "comment_count": int(statistics.get("commentCount", 0)),
-                "tags": snippet.get("tags", []),
-                "category_id": snippet.get("categoryId", "")
+                "video_id": info.get('id', ''),
+                "title": info.get('title', ''),
+                "channel_title": info.get('channel', ''),
+                "channel_id": info.get('channel_id', ''),
+                "description": info.get('description', ''),
+                "published_at": info.get('upload_date', ''),
+                "view_count": info.get('view_count', 0),
+                "like_count": info.get('like_count', 0),
+                "comment_count": info.get('comment_count', 0),
+                "tags": info.get('tags', []),
+                "category_id": info.get('category', '')
             }
             
         except Exception as e:
-            self.log.emit(f"Error getting details for video {video_id}: {str(e)}")
+            self.log.emit(f"Error getting details for video {video_url}: {str(e)}")
             return None
     
-    def get_related_videos(self, youtube, video_id):
-        """Get related videos for a given video."""
+    def get_related_videos(self, video_url):
+        """Get related videos for a given video using yt-dlp."""
         try:
-            # Use search API to find related videos
-            search_request = youtube.search().list(
-                part="snippet",
-                relatedToVideoId=video_id,
-                type="video",
-                maxResults=self.max_related
-            )
-            search_response = search_request.execute()
+            # Use yt-dlp to extract video information including related videos
+            ydl_opts = {
+                'quiet': True,
+                'writeinfojson': False,
+                'writesubtitles': False,
+                'getcomments': False,
+                'extract_flat': False,
+                'playlistend': self.max_related,
+            }
+            
+            with ytdlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
             
             related_videos = []
-            video_ids = []
             
-            # Extract video IDs from search results
-            for item in search_response.get("items", []):
-                video_id_related = item.get("id", {}).get("videoId", "")
-                if video_id_related:
-                    video_ids.append(video_id_related)
+            # Extract related videos from yt-dlp response
+            if 'related_videos' in info:
+                for related_video in info['related_videos'][:self.max_related]:
+                    if self._abort:
+                        break
+                    
+                    # Get detailed info for each related video
+                    try:
+                        related_url = f"https://www.youtube.com/watch?v={related_video.get('id', '')}"
+                        related_info = self.get_video_details(related_url)
+                        
+                        if related_info:
+                            related_video_data = {
+                                "source_video_id": info.get('id', ''),
+                                "video_id": related_info.get('video_id', ''),
+                                "title": related_info.get('title', ''),
+                                "channel_title": related_info.get('channel_title', ''),
+                                "channel_id": related_info.get('channel_id', ''),
+                                "description": related_info.get('description', ''),
+                                "published_at": related_info.get('published_at', ''),
+                                "view_count": related_info.get('view_count', 0),
+                                "like_count": related_info.get('like_count', 0),
+                                "comment_count": related_info.get('comment_count', 0),
+                                "duration": related_info.get('duration', ''),
+                                "tags": related_info.get('tags', []),
+                                "category_id": related_info.get('category_id', ''),
+                                "thumbnail_url": related_video.get('thumbnail', '')
+                            }
+                            related_videos.append(related_video_data)
+                    
+                    except Exception as e:
+                        self.log.emit(f"Error processing related video: {str(e)}")
+                        continue
             
-            # Get detailed information for related videos
-            if video_ids:
-                videos_request = youtube.videos().list(
-                    part="snippet,statistics,contentDetails",
-                    id=",".join(video_ids)
-                )
-                videos_response = videos_request.execute()
+            # If no related videos found, try alternative approach using search
+            if not related_videos:
+                self.log.emit("No related videos found, trying alternative approach...")
+                # Use the video title to search for similar content
+                search_query = info.get('title', '')[:50]  # Use first 50 chars of title
+                ydl_search_opts = {
+                    'quiet': True,
+                    'extract_flat': True,
+                    'playlistend': self.max_related,
+                    'default_search': 'ytsearch' + str(self.max_related),
+                }
                 
-                for video_item in videos_response.get("items", []):
-                    snippet = video_item.get("snippet", {})
-                    statistics = video_item.get("statistics", {})
-                    content_details = video_item.get("contentDetails", {})
-                    
-                    related_video = {
-                        "source_video_id": video_id,
-                        "video_id": video_item.get("id", ""),
-                        "title": snippet.get("title", ""),
-                        "channel_title": snippet.get("channelTitle", ""),
-                        "channel_id": snippet.get("channelId", ""),
-                        "description": snippet.get("description", ""),
-                        "published_at": snippet.get("publishedAt", ""),
-                        "view_count": int(statistics.get("viewCount", 0)),
-                        "like_count": int(statistics.get("likeCount", 0)),
-                        "comment_count": int(statistics.get("commentCount", 0)),
-                        "duration": content_details.get("duration", ""),
-                        "tags": snippet.get("tags", []),
-                        "category_id": snippet.get("categoryId", ""),
-                        "thumbnail_url": snippet.get("thumbnails", {}).get("default", {}).get("url", "")
-                    }
-                    
-                    related_videos.append(related_video)
+                with ytdlp.YoutubeDL(ydl_search_opts) as ydl:
+                    search_results = ydl.extract_info(f"ytsearch{self.max_related}:{search_query}", download=False)
+                
+                if 'entries' in search_results:
+                    for entry in search_results['entries'][:self.max_related]:
+                        if self._abort:
+                            break
+                        
+                        if entry.get('id') != info.get('id'):  # Exclude the source video
+                            related_video_data = {
+                                "source_video_id": info.get('id', ''),
+                                "video_id": entry.get('id', ''),
+                                "title": entry.get('title', ''),
+                                "channel_title": entry.get('channel', ''),
+                                "channel_id": entry.get('channel_id', ''),
+                                "description": entry.get('description', ''),
+                                "published_at": entry.get('upload_date', ''),
+                                "view_count": entry.get('view_count', 0),
+                                "like_count": entry.get('like_count', 0),
+                                "comment_count": entry.get('comment_count', 0),
+                                "duration": '',
+                                "tags": entry.get('tags', []),
+                                "category_id": entry.get('category', ''),
+                                "thumbnail_url": entry.get('thumbnail', '')
+                            }
+                            related_videos.append(related_video_data)
             
             return related_videos
             
         except Exception as e:
-            self.log.emit(f"Error getting related videos for {video_id}: {str(e)}")
+            self.log.emit(f"Error getting related videos for {video_url}: {str(e)}")
             return []
     
     def generate_content_recommendations(self, source_video, related_videos):
@@ -1181,8 +1455,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("YouTube OSINT Reconnaissance Tool")
         self.setWindowIcon(self.icon_from_b64())
         self.resize(1200, 800)
-        self.api_key = self.load_or_ask_key()
         self.results = []  # list of dicts
+        self.active_threads = []  # Track active threads for cleanup
         self.init_ui()
 
     # ---------------- UI -------------------------------------------------------
@@ -1194,7 +1468,7 @@ class MainWindow(QMainWindow):
         # --- top bar ---
         top = QHBoxLayout()
         self.query_le = QLineEdit()
-        self.query_le.setPlaceholderText("Search query, @channel, or video URL …")
+        self.query_le.setPlaceholderText("Search query, @channel, video URL, or video ID …")
         top.addWidget(QLabel("Query:"))
         top.addWidget(self.query_le)
 
@@ -1264,22 +1538,29 @@ class MainWindow(QMainWindow):
         return QtGui.QIcon(pm)
 
     def load_or_ask_key(self):
-        if SETTINGS_FILE.exists():
-            key = json.loads(SETTINGS_FILE.read_text()).get("api_key", "")
-            if key:
-                return key
-        key, ok = QtWidgets.QInputDialog.getText(self, "API Key Required",
-                                                 "Enter YouTube Data API v3 key:")
-        if ok and key:
-            SETTINGS_FILE.write_text(json.dumps({"api_key": key}))
-            return key
-        else:
-            QMessageBox.critical(self, "Fatal", "Cannot work without API key")
-            sys.exit(1)
+        # No API key needed with yt-dlp
+        return None
 
     def log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
         self.log_te.append(f"[{t}] {msg}")
+
+    def closeEvent(self, event):
+        """Handle application close event and clean up threads."""
+        # Clean up all active threads
+        for thread in self.active_threads:
+            if thread.isRunning():
+                thread.quit()
+                thread.wait(1000)  # Wait up to 1 second for thread to finish
+                if thread.isRunning():
+                    thread.terminate()
+                    thread.wait(500)  # Wait another 500ms for termination
+        event.accept()
+
+    def cleanup_thread(self, thread):
+        """Remove completed thread from active threads list."""
+        if thread in self.active_threads:
+            self.active_threads.remove(thread)
 
     def start_search(self, stype):
         q = self.query_le.text().strip()
@@ -1288,10 +1569,12 @@ class MainWindow(QMainWindow):
             return
         self.bar.setVisible(True)
         self.bar.setRange(0, 0)
-        thr = YouTubeSearchThread(self.api_key, q, stype)
+        thr = YouTubeSearchThread(q, stype)
         thr.log.connect(self.log)
         thr.error.connect(self.search_error)
         thr.result_ready.connect(self.search_done)
+        thr.finished.connect(lambda: self.cleanup_thread(thr))
+        self.active_threads.append(thr)
         thr.start()
 
     def analyze_url(self):
@@ -1299,29 +1582,71 @@ class MainWindow(QMainWindow):
         if not url:
             QMessageBox.warning(self, "Input", "Paste a YouTube URL first")
             return
-        # crude regex to grab id
-        vid_match = re.search(r"(?:v=|/v/|/embed/|/shorts/|/be/)([0-9A-Za-z_-]{11})", url)
-        chan_match = re.search(r"(?:channel/|c/|@|user/)([0-9A-Za-z_-]+)", url)
-        if vid_match:
-            self.bar.setVisible(True)
-            self.bar.setRange(0, 0)
-            thr = VideoDetailsThread(self.api_key, vid_match.group(1))
-            thr.log.connect(self.log)
-            thr.error.connect(self.search_error)
-            thr.result_ready.connect(self.video_done)
-            thr.start()
-        elif chan_match:
-            chan_id = chan_match.group(1)
-            # resolve @handle -> id via search
-            self.bar.setVisible(True)
-            self.bar.setRange(0, 0)
-            thr = YouTubeSearchThread(self.api_key, chan_id, "channel", max_results=1)
-            thr.log.connect(self.log)
-            thr.error.connect(self.search_error)
-            thr.result_ready.connect(self.resolve_channel_done)
-            thr.start()
+        
+        # Check if it's a full URL or just an ID
+        if url.startswith(('http://', 'https://')):
+            # It's a full URL, pass it directly
+            if '/watch?' in url or '/v/' in url or '/embed/' in url or '/shorts/' in url:
+                # Video URL
+                self.bar.setVisible(True)
+                self.bar.setRange(0, 0)
+                thr = VideoDetailsThread(url)
+                thr.log.connect(self.log)
+                thr.error.connect(self.search_error)
+                thr.result_ready.connect(self.video_done)
+                thr.finished.connect(lambda: self.cleanup_thread(thr))
+                self.active_threads.append(thr)
+                thr.start()
+            elif '/channel/' in url or '/c/' in url or '/user/' in url or '@' in url:
+                # Channel URL
+                self.bar.setVisible(True)
+                self.bar.setRange(0, 0)
+                thr = ChannelDetailsThread(url)
+                thr.log.connect(self.log)
+                thr.error.connect(self.search_error)
+                thr.result_ready.connect(self.channel_done)
+                thr.finished.connect(lambda: self.cleanup_thread(thr))
+                self.active_threads.append(thr)
+                thr.start()
+            else:
+                QMessageBox.warning(self, "Input", "Unrecognized YouTube URL format")
         else:
-            QMessageBox.warning(self, "Parse", "Could not extract video or channel ID")
+            # It might be just an ID, try to detect type
+            vid_match = re.search(r"^([0-9A-Za-z_-]{11})$", url)
+            chan_match = re.search(r"^([0-9A-Za-z_-]+)$", url)
+            
+            if vid_match and len(url) == 11:
+                # Video ID
+                video_url = f"https://www.youtube.com/watch?v={url}"
+                self.bar.setVisible(True)
+                self.bar.setRange(0, 0)
+                thr = VideoDetailsThread(video_url)
+                thr.log.connect(self.log)
+                thr.error.connect(self.search_error)
+                thr.result_ready.connect(self.video_done)
+                thr.finished.connect(lambda: self.cleanup_thread(thr))
+                self.active_threads.append(thr)
+                thr.start()
+            elif chan_match:
+                # Channel ID or handle
+                if url.startswith('@'):
+                    # Channel handle
+                    channel_url = f"https://www.youtube.com/{url}"
+                else:
+                    # Channel ID
+                    channel_url = f"https://www.youtube.com/channel/{url}"
+                
+                self.bar.setVisible(True)
+                self.bar.setRange(0, 0)
+                thr = ChannelDetailsThread(channel_url)
+                thr.log.connect(self.log)
+                thr.error.connect(self.search_error)
+                thr.result_ready.connect(self.channel_done)
+                thr.finished.connect(lambda: self.cleanup_thread(thr))
+                self.active_threads.append(thr)
+                thr.start()
+            else:
+                QMessageBox.warning(self, "Parse", "Could not extract video or channel ID")
 
     # ---------------- SLOTS ----------------------------------------------------
     def search_done(self, payload):
@@ -1336,10 +1661,12 @@ class MainWindow(QMainWindow):
             return
         chan = payload["items"][0]
         chan_id = chan["snippet"]["channelId"]
-        thr = ChannelDetailsThread(self.api_key, chan_id)
+        thr = ChannelDetailsThread(chan_id)
         thr.log.connect(self.log)
         thr.error.connect(self.search_error)
         thr.result_ready.connect(self.channel_done)
+        thr.finished.connect(lambda: self.cleanup_thread(thr))
+        self.active_threads.append(thr)
         thr.start()
 
     def video_done(self, vid):
@@ -1354,8 +1681,8 @@ class MainWindow(QMainWindow):
 
     def search_error(self, msg):
         self.bar.setVisible(False)
-        QMessageBox.critical(self, "API error", msg)
-        self.log(f"API error: {msg}")
+        QMessageBox.critical(self, "Error", msg)
+        self.log(f"Error: {msg}")
 
     def download_profile_images(self):
         """Download profile images for all channels in results."""
@@ -1385,6 +1712,8 @@ class MainWindow(QMainWindow):
             thr.log.connect(self.log)
             thr.error.connect(self.profile_image_error)
             thr.download_complete.connect(lambda cid, path: self.profile_image_complete(cid, path))
+            thr.finished.connect(lambda t=thr: self.cleanup_thread(t))
+            self.active_threads.append(thr)
             thr.start()
             
             # Update progress bar
@@ -1429,6 +1758,8 @@ class MainWindow(QMainWindow):
         thr.error.connect(self.google_dorking_error)
         thr.result_ready.connect(self.google_dorking_done)
         thr.progress.connect(self.bar.setValue)
+        thr.finished.connect(lambda: self.cleanup_thread(thr))
+        self.active_threads.append(thr)
         thr.start()
     
     def extract_target_info(self):
@@ -1576,6 +1907,8 @@ class MainWindow(QMainWindow):
         thr.error.connect(self.document_intelligence_error)
         thr.result_ready.connect(self.document_intelligence_done)
         thr.progress.connect(self.bar.setValue)
+        thr.finished.connect(lambda: self.cleanup_thread(thr))
+        self.active_threads.append(thr)
         thr.start()
     
     def get_search_engines_from_user(self):
@@ -1727,6 +2060,8 @@ class MainWindow(QMainWindow):
         thr.error.connect(self.video_analysis_error)
         thr.result_ready.connect(self.video_analysis_done)
         thr.progress.connect(self.bar.setValue)
+        thr.finished.connect(lambda: self.cleanup_thread(thr))
+        self.active_threads.append(thr)
         thr.start()
     
     def extract_video_ids(self):
@@ -1887,6 +2222,8 @@ class MainWindow(QMainWindow):
         thr.error.connect(self.related_videos_error)
         thr.result_ready.connect(self.related_videos_done)
         thr.progress.connect(self.bar.setValue)
+        thr.finished.connect(lambda: self.cleanup_thread(thr))
+        self.active_threads.append(thr)
         thr.start()
     
     def related_videos_done(self, results):
@@ -2066,12 +2403,24 @@ class MainWindow(QMainWindow):
         table.setColumnCount(5)
         table.setHorizontalHeaderLabels(["Type", "Title", "Channel", "Published", "ID"])
         for idx, it in enumerate(items):
-            snippet = it["snippet"]
-            kind = it["id"]["kind"].replace("youtube#", "")
-            title = snippet["title"]
-            chan = snippet["channelTitle"]
-            pub = snippet["publishedAt"][:10]
-            oid = it["id"].get("videoId") or it["id"].get("channelId") or it["id"].get("playlistId")
+            snippet = it.get("snippet", {})
+            
+            # Safely get the kind, handle different data structures
+            id_data = it.get("id", {})
+            if isinstance(id_data, dict):
+                kind = id_data.get("kind", "unknown").replace("youtube#", "")
+            else:
+                kind = "unknown"
+            
+            title = snippet.get("title", "N/A")
+            chan = snippet.get("channelTitle", "N/A")
+            pub = snippet.get("publishedAt", "")[:10] if snippet.get("publishedAt") else "N/A"
+            
+            # Safely get the ID
+            if isinstance(id_data, dict):
+                oid = id_data.get("videoId") or id_data.get("channelId") or id_data.get("playlistId") or str(id_data)
+            else:
+                oid = str(id_data) if id_data else "N/A"
             table.setItem(idx, 0, QTableWidgetItem(kind))
             table.setItem(idx, 1, QTableWidgetItem(title))
             table.setItem(idx, 2, QTableWidgetItem(chan))
